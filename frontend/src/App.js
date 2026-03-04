@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/select";
 import { Lock, Upload, Download, Share2, Trash2, Shield, Users, Activity, FileText, LogOut, Key } from "lucide-react";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8001";
 const API = `${BACKEND_URL}/api`;
 
 function App() {
@@ -882,6 +882,7 @@ function App() {
                 onChange={handleUploadNewVersion}
                 style={{ display: "none" }}
               />
+
               <div className="files-header">
                 <h2>Encrypted Files</h2>
                 <div className="upload-section">
@@ -892,21 +893,7 @@ function App() {
                     style={{ display: "none" }}
                     data-testid="file-upload-input"
                   />
-                          <CardTitle
-                            className="file-name"
-                            data-testid={`file-name-${file.id}`}
-                            onClick={() => {
-                              if (file.my_role === "editor" || file.my_role === "owner") {
-                                setSelectedFile(file);
-                                setRenameValue(file.filename);
-                                setRenameDialog(true);
-                              }
-                            }}
-                            style={{ cursor: (file.my_role === "editor" || file.my_role === "owner") ? "pointer" : "default" }}
-                            title={(file.my_role === "editor" || file.my_role === "owner") ? "Click to rename" : ""}
-                          >
-                            {file.filename}
-                          </CardTitle>
+                  <Button
                     onClick={() => document.getElementById("file-upload").click()}
                     disabled={uploading}
                     data-testid="upload-btn"
@@ -918,11 +905,6 @@ function App() {
               </div>
 
               <div className="files-grid">
-                          {file.my_role && (
-                            <div className="shared-info">
-                              <Badge variant="secondary">Role: {file.my_role}</Badge>
-                            </div>
-                          )}
                 {files.length === 0 ? (
                   <div className="empty-state" data-testid="empty-files-message">
                     <FileText size={48} />
@@ -932,78 +914,98 @@ function App() {
                   files.map((file) => (
                     <Card key={file.id} className="file-card" data-testid={`file-card-${file.id}`}>
                       <CardHeader>
-                        <CardTitle className="file-name" data-testid={`file-name-${file.id}`}>{file.filename}</CardTitle>
+                        <CardTitle
+                          className="file-name"
+                          data-testid={`file-name-${file.id}`}
+                          onClick={() => {
+                            if (file.my_role === "editor" || file.my_role === "owner") {
+                              setSelectedFile(file);
+                              setRenameValue(file.filename);
+                              setRenameDialog(true);
+                            }
+                          }}
+                          style={{ cursor: (file.my_role === "editor" || file.my_role === "owner") ? "pointer" : "default" }}
+                          title={(file.my_role === "editor" || file.my_role === "owner") ? "Click to rename" : ""}
+                        >
+                          {file.filename}
+                        </CardTitle>
                         <CardDescription>
                           <div className="file-meta">
                             <span>Owner: {file.owner_email}</span>
                             <span>Size: {(file.size / 1024).toFixed(2)} KB</span>
+                          </div>
+                        </CardDescription>
+                      </CardHeader>
 
-                            {(file.my_role === "editor" || file.my_role === "owner") && (
+                      <CardContent>
+                        {file.original_hash && (
+                          <div className="file-hash" data-testid={`file-hash-${file.id}`}>
+                            SHA-256: {file.original_hash}
+                          </div>
+                        )}
+
+                        {file.my_role && (
+                          <div className="shared-info">
+                            <Badge variant="secondary">Role: {file.my_role}</Badge>
+                          </div>
+                        )}
+
+                        <div className="file-actions">
+                          <Button
+                            variant="outline"
+                            onClick={() => handleDownload(file.id, file.filename)}
+                            data-testid={`download-btn-${file.id}`}
+                          >
+                            <Download size={14} />
+                            Download
+                          </Button>
+
+                          {(file.my_role === "editor" || file.my_role === "owner") && (
+                            <Button
+                              variant="outline"
+                              disabled={uploadingVersion}
+                              onClick={() => {
+                                setVersionTarget(file);
+                                document.getElementById("version-upload").click();
+                              }}
+                              title="Upload new version"
+                            >
+                              <Upload size={14} />
+                              New Version
+                            </Button>
+                          )}
+
+                          {file.my_role === "owner" && (
+                            <>
                               <Button
-                                size="sm"
                                 variant="outline"
-                                disabled={uploadingVersion}
                                 onClick={() => {
-                                  setVersionTarget(file);
-                                  document.getElementById("version-upload").click();
+                                  setSelectedFile(file);
+                                  setShareDialog(true);
                                 }}
-                                title="Upload new version"
+                                data-testid={`share-btn-${file.id}`}
                               >
-                                <Upload size={14} />
+                                <Share2 size={14} />
+                                Share
                               </Button>
-                            )}
-
-                            {file.my_role === "owner" && (
-                              <>
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => {
-                                    setSelectedFile(file);
-                                    setShareDialog(true);
-                                  }}
-                                  data-testid={`share-btn-${file.id}`}
-                                >
-                                  <Share2 size={14} />
-                                </Button>
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => {
-                                    setSelectedFile(file);
-                                    setLinkDialog(true);
-                                  }}
-                                  title="Create temporary link"
-                                >
-                                  <Key size={14} />
-                                </Button>
-                                <Button
-                                  size="sm"
-                                  variant="destructive"
-                                  onClick={() => handleDelete(file.id)}
-                                  data-testid={`delete-btn-${file.id}`}
-                                >
-                                  <Trash2 size={14} />
-                                </Button>
-                              </>
-                            )}
                               <Button
-                                size="sm"
                                 variant="outline"
                                 onClick={() => {
                                   setSelectedFile(file);
                                   setLinkDialog(true);
                                 }}
+                                title="Create temporary link"
                               >
                                 <Key size={14} />
+                                Link
                               </Button>
                               <Button
-                                size="sm"
                                 variant="destructive"
                                 onClick={() => handleDelete(file.id)}
                                 data-testid={`delete-btn-${file.id}`}
                               >
                                 <Trash2 size={14} />
+                                Delete
                               </Button>
                             </>
                           )}
