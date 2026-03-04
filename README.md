@@ -2,6 +2,8 @@
 
 ## Project Overview
 
+Developed/extended from: [lXsaraXl/securefilesharing](https://github.com/lXsaraXl/securefilesharing/tree/main)
+
 This project is designed as a secure file-sharing system with robust security features and user-friendly interface. It implements end-to-end encryption, multi-factor authentication, and role-based access control to ensure data privacy and integrity.
 
 ## Security Features Implemented

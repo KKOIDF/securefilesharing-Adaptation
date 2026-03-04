@@ -2,6 +2,8 @@
 
 ## 📋 Project Overview
 
+พัฒนา/ต่อยอดจากโปรเจกต์ต้นทาง: [lXsaraXl/securefilesharing](https://github.com/lXsaraXl/securefilesharing/tree/main)
+
 **SecureShare** is a web-based secure file-sharing system built for educational purposes as a graduation project. It demonstrates enterprise-grade security features including AES-256 encryption, RSA key exchange, multi-factor authentication, and role-based access control.
 
 ## 🔐 Security Features
