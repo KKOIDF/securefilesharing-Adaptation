@@ -84,6 +84,17 @@ async def mongo_ping() -> bool:
         return False
 
 
+async def ensure_indexes() -> None:
+    """Create minimal indexes needed for demo features."""
+    try:
+        await db.share_links.create_index("token_hash", unique=True)
+        await db.share_links.create_index("file_id")
+        await db.file_permissions.create_index([("file_id", 1), ("user_email", 1)], unique=True)
+    except Exception:
+        # Index creation is best-effort (e.g., restricted MongoDB tiers)
+        logger.exception("Failed to ensure MongoDB indexes")
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -1005,25 +1016,21 @@ async def get_share_link_payload(token: str):
     token_hash = hash_share_token(token)
     now_iso = utc_now().isoformat()
 
-    # Atomically consume a use (one-time links won't race)
-    link_doc = await db.share_links.find_one_and_update(
-        {
-            "token_hash": token_hash,
-            "expires_at": {"$gt": now_iso},
-            "$expr": {"$lt": ["$uses", "$max_uses"]},
-        },
-        {"$inc": {"uses": 1}},
-        projection={"_id": 0},
-        return_document=ReturnDocument.AFTER,
-    )
-
+    # Read first, then consume only after payload is successfully prepared.
+    # This avoids consuming a token if the file is missing or server fails
+    # while building the payload.
+    link_doc = await db.share_links.find_one({"token_hash": token_hash}, {"_id": 0})
     if not link_doc:
-        # distinguish expired vs consumed if possible
-        existing = await db.share_links.find_one({"token_hash": token_hash}, {"_id": 0, "expires_at": 1, "uses": 1, "max_uses": 1})
-        if not existing:
-            raise HTTPException(status_code=404, detail="Share link not found")
-        if utc_now() > datetime.fromisoformat(existing["expires_at"]):
-            raise HTTPException(status_code=410, detail="Link expired")
+        raise HTTPException(status_code=404, detail="Share link not found")
+
+    try:
+        expires_at = datetime.fromisoformat(link_doc["expires_at"]) if isinstance(link_doc.get("expires_at"), str) else None
+    except Exception:
+        expires_at = None
+
+    if expires_at and utc_now() > expires_at:
+        raise HTTPException(status_code=410, detail="Link expired")
+    if int(link_doc.get("uses", 0)) >= int(link_doc.get("max_uses", 0) or 0):
         raise HTTPException(status_code=410, detail="Link consumed")
 
     file_doc = await db.files.find_one({"id": link_doc["file_id"]}, {"_id": 0})
@@ -1058,6 +1065,32 @@ async def get_share_link_payload(token: str):
             raise HTTPException(status_code=500, detail="Owner record missing")
         file_key_b64 = decrypt_key_rsa(file_doc["encrypted_key"], owner["private_key"])
         wrapped_key = _wrap_file_key_token_derived(file_key_b64, token)
+
+    # Atomically consume a use now that payload is ready.
+    consumed = await db.share_links.find_one_and_update(
+        {
+            "token_hash": token_hash,
+            "expires_at": {"$gt": now_iso},
+            "$expr": {"$lt": ["$uses", "$max_uses"]},
+        },
+        {"$inc": {"uses": 1}},
+        projection={"_id": 0, "uses": 1, "max_uses": 1, "expires_at": 1},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not consumed:
+        # distinguish expired vs consumed if possible
+        existing = await db.share_links.find_one(
+            {"token_hash": token_hash},
+            {"_id": 0, "expires_at": 1, "uses": 1, "max_uses": 1},
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Share link not found")
+        try:
+            if utc_now() > datetime.fromisoformat(existing["expires_at"]):
+                raise HTTPException(status_code=410, detail="Link expired")
+        except Exception:
+            pass
+        raise HTTPException(status_code=410, detail="Link consumed")
 
     await log_action("anonymous", "CONSUME_LINK", file_doc.get("id"), file_doc.get("filename"))
 
@@ -1148,3 +1181,8 @@ logging.basicConfig(
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
+
+@app.on_event("startup")
+async def startup_indexes():
+    await ensure_indexes()

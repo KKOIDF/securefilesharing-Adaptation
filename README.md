@@ -11,7 +11,9 @@ This project is designed as a secure file-sharing system with robust security fe
 - **AES-256 Encryption**: Files are encrypted before storage using 256-bit keys
 - **RSA Encryption (2048-bit)**: Secure key exchange with RSA keypairs per user
 - **Email-based MFA**: 6-digit OTP verification (demo mode displays OTP on screen)
-- **Role-Based Access Control**: Admin and User roles with specified permissions
+- **Role-Based Access Control (RBAC)**:
+   - Global roles: `admin` / `user`
+   - Per-file roles: `owner` / `editor` / `viewer` (enforced on download/rename/version/share/revoke/link)
 - **SHA-256 Hashing**: File integrity verification on upload/download
 
 ## Core Functionality
@@ -127,6 +129,8 @@ Access the admin panel if logged in as admin:
 
 - OTPs are displayed on screen instead of being emailed (for demo purposes)
 - Role selection during registration
+- Temporary share links: expiring + limited uses (one-time links supported)
+- Optional “zero-knowledge style” links using `#secret` URL fragment (not sent to server)
 - Clean and professional UI
 - Audit trail available in admin panel
 
