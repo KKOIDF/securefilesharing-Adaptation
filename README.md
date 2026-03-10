@@ -159,6 +159,8 @@ The backend provides RESTful APIs for all operations. Key endpoints include:
 - `GET /api/admin/users` - Admin: List users
 - `GET /api/admin/logs` - Admin: View logs
 - `GET /api/admin/stats` - Admin: System stats
+- `GET /api/examples/status` - Example module status
+- `GET /api/examples/deploy-checklist` - Example deployment checklist payload
 
 ## RBAC (Per-file)
 
@@ -173,6 +175,10 @@ Audit log events added for demo:
 - `CREATE_LINK`
 - `CONSUME_LINK`
 - `REVOKE_ACCESS`
+
+## Deployment
+
+ดูคู่มือ deployment แบบละเอียดได้ที่ `DEPLOYMENT.md` (รวม env, build/run และ smoke checks สำหรับ example module/routes/frontend ตัวอย่าง)
 
 ## Testing
 

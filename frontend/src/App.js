@@ -54,6 +54,8 @@ function App() {
   const [users, setUsers] = useState([]);
   const [logs, setLogs] = useState([]);
   const [stats, setStats] = useState({});
+  const [exampleStatus, setExampleStatus] = useState(null);
+  const [deployChecklist, setDeployChecklist] = useState([]);
   
   // Dialogs
   const [shareDialog, setShareDialog] = useState(false);
@@ -111,6 +113,7 @@ function App() {
   useEffect(() => {
     if (view === "dashboard" && token) {
       loadFiles();
+      loadExampleData();
       if (user?.role === "admin") {
         loadAdminData();
       }
@@ -390,6 +393,19 @@ function App() {
       setFiles(res.data.files);
     } catch (err) {
       toast.error("Failed to load files");
+    }
+  };
+
+  const loadExampleData = async () => {
+    try {
+      const [statusRes, checklistRes] = await Promise.all([
+        axios.get(`${API}/examples/status`, axiosConfig()),
+        axios.get(`${API}/examples/deploy-checklist`, axiosConfig()),
+      ]);
+      setExampleStatus(statusRes.data);
+      setDeployChecklist(checklistRes.data.steps || []);
+    } catch (err) {
+      toast.error("Failed to load example module data");
     }
   };
 
@@ -1106,6 +1122,10 @@ function App() {
                 <FileText size={16} />
                 My Files
               </TabsTrigger>
+              <TabsTrigger value="example" data-testid="example-tab">
+                <Activity size={16} />
+                Example Module
+              </TabsTrigger>
               {user?.role === "admin" && (
                 <>
                   <TabsTrigger value="users" data-testid="users-tab">
@@ -1301,6 +1321,35 @@ function App() {
                     </Card>
                   ))
                 )}
+              </div>
+            </TabsContent>
+
+            <TabsContent value="example" data-testid="example-content">
+              <h2>Example Module + Routes</h2>
+              <div className="stats-grid">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Route Status</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <p><strong>Module:</strong> {exampleStatus?.module || "-"}</p>
+                    <p><strong>Status:</strong> {exampleStatus?.status || "-"}</p>
+                    <p><strong>Environment:</strong> {exampleStatus?.environment || "-"}</p>
+                    <p><strong>Timestamp:</strong> {exampleStatus?.timestamp ? new Date(exampleStatus.timestamp).toLocaleString() : "-"}</p>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Deploy Checklist (API-driven)</CardTitle>
+                  </CardHeader>
+                  <CardContent>
+                    <ol style={{ margin: 0, paddingLeft: "1.2rem" }}>
+                      {deployChecklist.map((step, idx) => (
+                        <li key={idx} style={{ marginBottom: "0.5rem" }}>{step}</li>
+                      ))}
+                    </ol>
+                  </CardContent>
+                </Card>
               </div>
             </TabsContent>
 

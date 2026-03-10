@@ -27,6 +27,8 @@ import random
 import io
 import secrets
 
+from modules.example_routes import router as example_router
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env.local', override=True)
 load_dotenv(ROOT_DIR / '.env')
@@ -1539,8 +1541,9 @@ async def health_db():
     ok = await mongo_ping()
     return {"db": "ok" if ok else "down"}
 
-# Include router
+# Include routers
 app.include_router(api_router)
+app.include_router(example_router, prefix="/api")
 
 app.add_middleware(
     CORSMiddleware,
