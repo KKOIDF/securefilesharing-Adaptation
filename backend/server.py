@@ -30,7 +30,7 @@ import secrets
 from modules.example_routes import router as example_router
 
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env.local', override=True)
+load_dotenv(ROOT_DIR / '.env.local', override=False)
 load_dotenv(ROOT_DIR / '.env')
 
 class _UnavailableDB:
