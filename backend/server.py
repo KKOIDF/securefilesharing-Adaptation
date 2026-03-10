@@ -1,11 +1,11 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Header
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Header, Form
 from fastapi.responses import StreamingResponse
 from starlette.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
-from pymongo.errors import ServerSelectionTimeoutError, AutoReconnect
+from pymongo.errors import ServerSelectionTimeoutError, AutoReconnect, ConfigurationError
 import os
 import logging
 from pathlib import Path
@@ -15,6 +15,8 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from passlib.context import CryptContext
 import jwt
+from google.oauth2 import id_token as google_id_token
+from google.auth.transport import requests as google_requests
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
@@ -26,23 +28,41 @@ import io
 import secrets
 
 ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env.local', override=True)
 load_dotenv(ROOT_DIR / '.env')
 
+class _UnavailableDB:
+    def __getattr__(self, name):
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable. Start MongoDB or fix MONGO_URL.",
+        )
+
+
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
+mongo_url = os.environ.get('MONGO_URL')
 
 # Fail fast if MongoDB is not reachable (demo/dev friendly)
 MONGO_SERVER_SELECTION_TIMEOUT_MS = int(os.environ.get("MONGO_SERVER_SELECTION_TIMEOUT_MS", "20000"))
 MONGO_CONNECT_TIMEOUT_MS = int(os.environ.get("MONGO_CONNECT_TIMEOUT_MS", "20000"))
 MONGO_SOCKET_TIMEOUT_MS = int(os.environ.get("MONGO_SOCKET_TIMEOUT_MS", "20000"))
 
-client = AsyncIOMotorClient(
-    mongo_url,
-    serverSelectionTimeoutMS=MONGO_SERVER_SELECTION_TIMEOUT_MS,
-    connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
-    socketTimeoutMS=MONGO_SOCKET_TIMEOUT_MS,
-)
-db = client[os.environ['DB_NAME']]
+client = None
+db = _UnavailableDB()
+
+if mongo_url:
+    try:
+        client = AsyncIOMotorClient(
+            mongo_url,
+            serverSelectionTimeoutMS=MONGO_SERVER_SELECTION_TIMEOUT_MS,
+            connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
+            socketTimeoutMS=MONGO_SOCKET_TIMEOUT_MS,
+        )
+        db = client[os.environ.get('DB_NAME', 'securefileshare')]
+    except (ConfigurationError, Exception):
+        logging.getLogger(__name__).exception("Failed to initialize MongoDB client")
+        client = None
+        db = _UnavailableDB()
 
 # Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -77,6 +97,8 @@ async def mongo_autoreconnect_handler(request, exc):
 
 
 async def mongo_ping() -> bool:
+    if client is None:
+        return False
     try:
         await client.admin.command("ping")
         return True
@@ -86,10 +108,14 @@ async def mongo_ping() -> bool:
 
 async def ensure_indexes() -> None:
     """Create minimal indexes needed for demo features."""
+    if client is None:
+        return
     try:
         await db.share_links.create_index("token_hash", unique=True)
         await db.share_links.create_index("file_id")
         await db.file_permissions.create_index([("file_id", 1), ("user_email", 1)], unique=True)
+        await db.file_access_codes.create_index("code_hash", unique=True)
+        await db.file_access_codes.create_index("file_id")
     except Exception:
         # Index creation is best-effort (e.g., restricted MongoDB tiers)
         logger.exception("Failed to ensure MongoDB indexes")
@@ -115,6 +141,19 @@ def hash_share_token(token: str) -> str:
     return sha256_hex(token.encode("utf-8"))
 
 
+def parse_dt(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except Exception:
+            return None
+    return None
+
+
 def email_map_key(email: str) -> str:
     """Encode an email into a Mongo-safe key.
 
@@ -138,6 +177,10 @@ class UserLogin(BaseModel):
 class OTPVerify(BaseModel):
     email: EmailStr
     otp: str
+
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
 
 class User(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -165,6 +208,9 @@ class FileMetadata(BaseModel):
     size: int
     shared_with: List[str] = []  # List of user emails
     uploaded_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    # Additional discretionary access control (DAC): require a code/password to download
+    access_password_hash: Optional[str] = None
+    access_password_set_at: Optional[str] = None
 
 
 class FilePermission(BaseModel):
@@ -181,6 +227,8 @@ class ShareLinkCreateRequest(BaseModel):
     expiresInMinutes: int = Field(gt=0, le=60 * 24 * 30)
     maxUses: int = Field(gt=0, le=1000)
     zeroKnowledge: bool = False
+    # Optional: owner can set a custom access code for this link; otherwise system generates one.
+    accessCode: Optional[str] = Field(default=None, min_length=4, max_length=128)
 
 
 class ShareLinkKeySetupRequest(BaseModel):
@@ -204,6 +252,32 @@ class ShareLinkDoc(BaseModel):
     enc_file_key_iv_b64: Optional[str] = None
     enc_file_key_tag_b64: Optional[str] = None
     key_wrap: Literal["token-derived", "fragment-secret"] = "token-derived"
+    # Additional secret required to use the link (never store raw code)
+    access_code_hash: Optional[str] = None
+
+
+class FileAccessPasswordRequest(BaseModel):
+    password: str = Field(min_length=4, max_length=128)
+
+
+class FileAccessCodeCreateRequest(BaseModel):
+    expiresInMinutes: int = Field(gt=0, le=60 * 24 * 30)
+    allowedEmail: Optional[EmailStr] = None
+    label: Optional[str] = Field(default=None, max_length=64)
+    # Optional: owner can choose a custom code; otherwise system generates one.
+    accessCode: Optional[str] = Field(default=None, min_length=4, max_length=128)
+
+
+class FileAccessCodeDoc(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    file_id: str
+    code_hash: str
+    expires_at: datetime
+    allowed_email: Optional[EmailStr] = None
+    label: Optional[str] = None
+    created_by: EmailStr
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class AccessLog(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -221,6 +295,46 @@ def hash_password(password: str) -> str:
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
+
+
+async def require_valid_file_access_code(file_doc: dict, current_user: dict, access_code: Optional[str]) -> None:
+    """Enforce per-file access code/password before allowing file download.
+
+    Accepts either:
+    - the file's access password, or
+    - a time-limited access code created by the file owner (optionally bound to a recipient email).
+    """
+    access_hash = file_doc.get("access_password_hash")
+    if not access_hash:
+        # For legacy files created before this feature: require owner to set a password first.
+        raise HTTPException(status_code=428, detail="File access password is not set. Owner must set one before downloads are allowed.")
+
+    if not access_code:
+        raise HTTPException(status_code=401, detail="Access code required")
+
+    # 1) File-level password
+    try:
+        if verify_password(access_code, access_hash):
+            return
+    except Exception:
+        # Treat as invalid and continue with access-code lookup
+        pass
+
+    # 2) Expiring access code
+    code_hash = hash_share_token(access_code)
+    code_doc = await db.file_access_codes.find_one({"file_id": file_doc.get("id"), "code_hash": code_hash}, {"_id": 0})
+    if not code_doc:
+        raise HTTPException(status_code=403, detail="Invalid or expired access code")
+
+    expires_at = parse_dt(code_doc.get("expires_at"))
+    if expires_at and utc_now() > expires_at:
+        raise HTTPException(status_code=403, detail="Invalid or expired access code")
+
+    allowed_email = (code_doc.get("allowed_email") or "").strip().lower() or None
+    if allowed_email and allowed_email != (current_user.get("email") or "").strip().lower():
+        raise HTTPException(status_code=403, detail="Access code not valid for this user")
+
+    return
 
 def generate_rsa_keypair():
     """Generate RSA key pair for each user"""
@@ -624,11 +738,74 @@ async def resend_otp(data: dict):
     
     return {"message": "OTP resent", "otp_for_demo": otp}
 
+
+@api_router.post("/auth/google")
+async def google_login(payload: GoogleAuthRequest):
+    google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    if not google_client_id:
+        raise HTTPException(status_code=500, detail="GOOGLE_CLIENT_ID is not configured on the server")
+
+    try:
+        idinfo = google_id_token.verify_oauth2_token(
+            payload.id_token,
+            google_requests.Request(),
+            audience=google_client_id,
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+    email = (idinfo.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Google token missing email")
+
+    if idinfo.get("email_verified") is False:
+        raise HTTPException(status_code=401, detail="Google email is not verified")
+
+    full_name = (idinfo.get("name") or idinfo.get("given_name") or "").strip() or email.split("@")[0]
+
+    try:
+        user = await db.users.find_one({"email": email}, {"_id": 0})
+        if not user:
+            private_key, public_key = generate_rsa_keypair()
+            random_password = secrets.token_urlsafe(32)
+            new_user = User(
+                email=email,
+                full_name=full_name,
+                role="user",
+                password_hash=hash_password(random_password),
+                public_key=public_key,
+                private_key=private_key,
+            )
+            doc = new_user.model_dump()
+            doc["created_at"] = doc["created_at"].isoformat()
+            doc["auth_provider"] = "google"
+            doc["google_sub"] = idinfo.get("sub")
+            await db.users.insert_one(doc)
+            user = doc
+            await log_action(email, "Google login - user created")
+        else:
+            await log_action(email, "Google login")
+    except Exception:
+        logger.exception("Google login failed due to database error")
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    token = create_access_token({"sub": user["email"], "role": user.get("role", "user")})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "email": user["email"],
+            "full_name": user.get("full_name") or full_name,
+            "role": user.get("role", "user"),
+        },
+    }
+
 # ========== FILE ENDPOINTS ==========
 
 @api_router.post("/files/upload")
 async def upload_file(
     file: UploadFile = File(...),
+    access_password: str = Form(...),
     current_user: dict = Depends(get_current_user)
 ):
     # Read file
@@ -653,7 +830,9 @@ async def upload_file(
         encrypted_keys={email_map_key(current_user["email"]): encrypted_key},
         owner_id=current_user["id"],
         owner_email=current_user["email"],
-        size=len(file_data)
+        size=len(file_data),
+        access_password_hash=hash_password(access_password),
+        access_password_set_at=utc_now().isoformat(),
     )
     
     doc = file_metadata.model_dump()
@@ -699,16 +878,24 @@ async def list_files(current_user: dict = Depends(get_current_user)):
             {"shared_with": current_user["email"]},
         ]
     }
-    files = await db.files.find(query, {"_id": 0, "encrypted_data": 0, "encrypted_key": 0}).to_list(1000)
+    files = await db.files.find(
+        query,
+        {"_id": 0, "encrypted_data": 0, "encrypted_key": 0, "access_password_hash": 0},
+    ).to_list(1000)
 
     # Attach caller's role for UI decisions
     for f in files:
         f["my_role"] = await get_file_role(f, current_user)
+        f["access_protected"] = bool(f.get("access_password_hash"))
     
     return {"files": files}
 
 @api_router.get("/files/download/{file_id}")
-async def download_file(file_id: str, current_user: dict = Depends(get_current_user)):
+async def download_file(
+    file_id: str,
+    x_file_access_code: Optional[str] = Header(None, alias="X-File-Access-Code"),
+    current_user: dict = Depends(get_current_user),
+):
     # Get file
     file_doc = await db.files.find_one({"id": file_id}, {"_id": 0})
     if not file_doc:
@@ -716,6 +903,9 @@ async def download_file(file_id: str, current_user: dict = Depends(get_current_u
     
     role = await get_file_role(file_doc, current_user)
     require_role(role, ["viewer", "editor", "owner"])
+
+    # Enforce access password/code for everyone (including owner)
+    await require_valid_file_access_code(file_doc, current_user, x_file_access_code)
     
     # Decrypt AES key with user's RSA private key (supports per-recipient keys)
     aes_key = await get_file_key_for_user(file_doc, current_user)
@@ -735,6 +925,165 @@ async def download_file(file_id: str, current_user: dict = Depends(get_current_u
         media_type="application/octet-stream",
         headers={"Content-Disposition": f"attachment; filename={file_doc['filename']}"}
     )
+
+
+@api_router.put("/files/{file_id}/access-password")
+async def set_file_access_password(
+    file_id: str,
+    body: FileAccessPasswordRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    file_doc = await db.files.find_one({"id": file_id}, {"_id": 0})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    role = await get_file_role(file_doc, current_user)
+    require_role(role, ["owner"])
+
+    await db.files.update_one(
+        {"id": file_id},
+        {"$set": {"access_password_hash": hash_password(body.password), "access_password_set_at": utc_now().isoformat()}},
+    )
+    await log_action(current_user["email"], "SET_ACCESS_PASSWORD", file_id, file_doc.get("filename"))
+    return {"message": "Access password set"}
+
+
+@api_router.delete("/files/{file_id}/access-password")
+async def clear_file_access_password(
+    file_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    file_doc = await db.files.find_one({"id": file_id}, {"_id": 0})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    role = await get_file_role(file_doc, current_user)
+    require_role(role, ["owner"])
+
+    await db.files.update_one({"id": file_id}, {"$set": {"access_password_hash": None, "access_password_set_at": None}})
+    await db.file_access_codes.delete_many({"file_id": file_id})
+    await log_action(current_user["email"], "CLEAR_ACCESS_PASSWORD", file_id, file_doc.get("filename"))
+    return {"message": "Access password cleared"}
+
+
+@api_router.post("/files/{file_id}/access-codes")
+async def create_file_access_code(
+    file_id: str,
+    body: FileAccessCodeCreateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    file_doc = await db.files.find_one({"id": file_id}, {"_id": 0})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    role = await get_file_role(file_doc, current_user)
+    require_role(role, ["owner"])
+
+    # Ensure the file has a password configured (baseline protection)
+    if not file_doc.get("access_password_hash"):
+        raise HTTPException(status_code=428, detail="File access password is not set. Set it before creating access codes.")
+
+    # DAC convenience: if the code is bound to an email, also grant viewer access and prepare the per-recipient file key.
+    if body.allowedEmail:
+        recipient_email = body.allowedEmail.strip().lower()
+        target_user = await db.users.find_one({"email": recipient_email}, {"_id": 0})
+        if not target_user:
+            raise HTTPException(status_code=404, detail="Target user not found")
+
+        try:
+            owner_file_key_b64 = await get_file_key_for_user(file_doc, current_user)
+            recipient_encrypted_key = encrypt_key_rsa(owner_file_key_b64, target_user["public_key"])
+            safe_recipient_key = email_map_key(recipient_email)
+            await db.files.update_one(
+                {"id": file_id},
+                {"$set": {f"encrypted_keys.{safe_recipient_key}": recipient_encrypted_key}},
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to prepare key for recipient: {str(e)}")
+
+        # Add to shared list (legacy UI field)
+        if recipient_email not in file_doc.get("shared_with", []):
+            await db.files.update_one({"id": file_id}, {"$addToSet": {"shared_with": recipient_email}})
+
+        # Upsert RBAC permission (viewer)
+        perm_doc = FilePermission(
+            file_id=file_id,
+            user_email=recipient_email,
+            role="viewer",
+            granted_by=current_user["email"],
+        ).model_dump()
+        perm_doc["created_at"] = perm_doc["created_at"].isoformat()
+        perm_doc_on_insert = {
+            "id": perm_doc["id"],
+            "file_id": perm_doc["file_id"],
+            "user_email": perm_doc["user_email"],
+            "created_at": perm_doc["created_at"],
+        }
+        await db.file_permissions.update_one(
+            {"file_id": file_id, "user_email": recipient_email},
+            {"$set": {"role": "viewer", "granted_by": current_user["email"]}, "$setOnInsert": perm_doc_on_insert},
+            upsert=True,
+        )
+
+    raw_code = (body.accessCode or "").strip() or secrets.token_urlsafe(12)
+    code_hash = hash_share_token(raw_code)
+    expires_at = utc_now() + timedelta(minutes=body.expiresInMinutes)
+
+    doc = FileAccessCodeDoc(
+        file_id=file_id,
+        code_hash=code_hash,
+        expires_at=expires_at,
+        allowed_email=(body.allowedEmail.strip().lower() if body.allowedEmail else None),
+        label=(body.label.strip() if body.label else None),
+        created_by=current_user["email"],
+    ).model_dump()
+    doc["created_at"] = doc["created_at"].isoformat()
+    doc["expires_at"] = doc["expires_at"].isoformat()
+
+    await db.file_access_codes.insert_one(doc)
+    await log_action(current_user["email"], "CREATE_ACCESS_CODE", file_id, file_doc.get("filename"))
+
+    return {
+        "id": doc["id"],
+        "code": raw_code,
+        "expires_at": doc["expires_at"],
+        "allowed_email": doc.get("allowed_email"),
+        "label": doc.get("label"),
+    }
+
+
+@api_router.get("/files/{file_id}/access-codes")
+async def list_file_access_codes(
+    file_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    file_doc = await db.files.find_one({"id": file_id}, {"_id": 0})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    role = await get_file_role(file_doc, current_user)
+    require_role(role, ["owner"])
+
+    codes = await db.file_access_codes.find({"file_id": file_id}, {"_id": 0, "code_hash": 0}).sort("created_at", -1).to_list(200)
+    return {"codes": codes}
+
+
+@api_router.delete("/files/{file_id}/access-codes/{code_id}")
+async def revoke_file_access_code(
+    file_id: str,
+    code_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    file_doc = await db.files.find_one({"id": file_id}, {"_id": 0})
+    if not file_doc:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    role = await get_file_role(file_doc, current_user)
+    require_role(role, ["owner"])
+
+    await db.file_access_codes.delete_one({"id": code_id, "file_id": file_id})
+    await log_action(current_user["email"], "REVOKE_ACCESS_CODE", file_id, file_doc.get("filename"))
+    return {"message": "Access code revoked"}
 
 @api_router.delete("/files/delete/{file_id}")
 async def delete_file(file_id: str, current_user: dict = Depends(get_current_user)):
@@ -957,6 +1306,9 @@ async def create_share_link(
     token_hash = hash_share_token(token)
     expires_at = utc_now() + timedelta(minutes=body.expiresInMinutes)
 
+    raw_access_code = (body.accessCode or "").strip() or secrets.token_urlsafe(12)
+    access_code_hash = hash_share_token(raw_access_code)
+
     link = ShareLinkDoc(
         file_id=file_id,
         token_hash=token_hash,
@@ -965,6 +1317,7 @@ async def create_share_link(
         uses=0,
         created_by=current_user["email"],
         key_wrap="fragment-secret" if body.zeroKnowledge else "token-derived",
+        access_code_hash=access_code_hash,
     )
     doc = link.model_dump()
     doc["created_at"] = doc["created_at"].isoformat()
@@ -974,8 +1327,8 @@ async def create_share_link(
     await log_action(current_user["email"], "CREATE_LINK", file_id, file_doc.get("filename"))
 
     url = f"{_frontend_base_url()}/share/{token}"
-    # Spec requires returning { url } (we also return zeroKnowledge for client convenience)
-    return {"url": url, "zeroKnowledge": body.zeroKnowledge}
+    # Return accessCode once so owner can share it out-of-band.
+    return {"url": url, "zeroKnowledge": body.zeroKnowledge, "accessCode": raw_access_code}
 
 
 @api_router.post("/share/{token}/zk-setup")
@@ -1012,7 +1365,10 @@ async def setup_zero_knowledge_link(
 
 
 @api_router.get("/share/{token}")
-async def get_share_link_payload(token: str):
+async def get_share_link_payload(
+    token: str,
+    x_share_access_code: Optional[str] = Header(None, alias="X-Share-Access-Code"),
+):
     token_hash = hash_share_token(token)
     now_iso = utc_now().isoformat()
 
@@ -1036,6 +1392,27 @@ async def get_share_link_payload(token: str):
     file_doc = await db.files.find_one({"id": link_doc["file_id"]}, {"_id": 0})
     if not file_doc:
         raise HTTPException(status_code=404, detail="File not found")
+
+    # Require a password/code to use the link.
+    if not x_share_access_code:
+        raise HTTPException(status_code=401, detail="Access code required")
+
+    # Accept either the per-file password or the link-specific access code.
+    ok = False
+    try:
+        file_pw_hash = file_doc.get("access_password_hash")
+        if file_pw_hash and verify_password(x_share_access_code, file_pw_hash):
+            ok = True
+    except Exception:
+        ok = False
+
+    if not ok:
+        link_code_hash = link_doc.get("access_code_hash")
+        if link_code_hash and hash_share_token(x_share_access_code) == link_code_hash:
+            ok = True
+
+    if not ok:
+        raise HTTPException(status_code=403, detail="Invalid or expired access code")
 
     # Split encrypted file payload for client-side decrypt
     combined = _b64d(file_doc["encrypted_data"])
@@ -1180,7 +1557,8 @@ logging.basicConfig(
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client is not None:
+        client.close()
 
 
 @app.on_event("startup")

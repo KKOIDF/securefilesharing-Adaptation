@@ -40,13 +40,16 @@ class SecureShareAPITester:
         })
         return success
 
-    def make_request(self, method, endpoint, data=None, files=None, token=None, expect_status=200):
+    def make_request(self, method, endpoint, data=None, files=None, token=None, expect_status=200, extra_headers=None):
         """Make HTTP request with error handling"""
         url = f"{self.api_url}/{endpoint}"
         headers = {'Content-Type': 'application/json'}
         
         if token:
             headers['Authorization'] = f'Bearer {token}'
+
+        if extra_headers:
+            headers.update(extra_headers)
         
         if files:
             # Remove Content-Type for file uploads
@@ -57,7 +60,8 @@ class SecureShareAPITester:
                 response = requests.get(url, headers=headers)
             elif method == 'POST':
                 if files:
-                    response = requests.post(url, files=files, headers=headers)
+                    # For multipart, send form fields via `data` and file via `files`
+                    response = requests.post(url, files=files, data=(data or {}), headers=headers)
                 else:
                     response = requests.post(url, json=data, headers=headers)
             elif method == 'DELETE':
@@ -188,9 +192,13 @@ class SecureShareAPITester:
         test_file = io.BytesIO(test_content)
         
         files = {'file': ('test_document.txt', test_file, 'text/plain')}
+
+        # Per-file access password is required by the API
+        upload_data = {"access_password": "FilePass123!"}
+        self._last_file_access_password = upload_data["access_password"]
         
-        success, response = self.make_request('POST', 'files/upload', files=files, 
-                                            token=self.user_token, expect_status=200)
+        success, response = self.make_request('POST', 'files/upload', data=upload_data, files=files, 
+                            token=self.user_token, expect_status=200)
         
         if success and 'file_id' in response:
             self.uploaded_file_id = response['file_id']
@@ -217,8 +225,14 @@ class SecureShareAPITester:
         if not self.user_token or not self.uploaded_file_id:
             return self.log_test("File Download", False, "No token or file ID available")
         
-        success, response = self.make_request('GET', f'files/download/{self.uploaded_file_id}', 
-                                            token=self.user_token, expect_status=200)
+        access_code = getattr(self, "_last_file_access_password", None) or "FilePass123!"
+        success, response = self.make_request(
+            'GET',
+            f'files/download/{self.uploaded_file_id}',
+            token=self.user_token,
+            expect_status=200,
+            extra_headers={"X-File-Access-Code": access_code},
+        )
         
         if success:
             # Check if we got file content back

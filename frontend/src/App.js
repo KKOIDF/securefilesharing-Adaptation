@@ -22,6 +22,7 @@ import { Lock, Upload, Download, Share2, Trash2, Shield, Users, Activity, FileTe
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8001";
 const API = `${BACKEND_URL}/api`;
+const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID;
 
 function App() {
   const [view, setView] = useState("landing"); // landing, otp, dashboard
@@ -29,15 +30,25 @@ function App() {
   const [token, setToken] = useState(null);
   const [pendingEmail, setPendingEmail] = useState("");
   const [demoOtp, setDemoOtp] = useState("");
+  const [googleSigningIn, setGoogleSigningIn] = useState(false);
 
   // Public share link
   const [shareToken, setShareToken] = useState(null);
   const [shareLoading, setShareLoading] = useState(false);
   const [shareFileName, setShareFileName] = useState("");
+  const [shareAccessCode, setShareAccessCode] = useState("");
   
   // Files
   const [files, setFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadDialog, setUploadDialog] = useState(false);
+  const [pendingUploadFile, setPendingUploadFile] = useState(null);
+  const [pendingUploadPassword, setPendingUploadPassword] = useState("");
+
+  const [downloadDialog, setDownloadDialog] = useState(false);
+  const [downloadTarget, setDownloadTarget] = useState(null);
+  const [downloadAccessCode, setDownloadAccessCode] = useState("");
+  const [downloading, setDownloading] = useState(false);
   
   // Admin
   const [users, setUsers] = useState([]);
@@ -49,6 +60,16 @@ function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [shareEmail, setShareEmail] = useState("");
   const [shareRole, setShareRole] = useState("viewer");
+
+  const [accessCodeEmail, setAccessCodeEmail] = useState("");
+  const [accessCodeTtl, setAccessCodeTtl] = useState("10");
+  const [accessCodeCustom, setAccessCodeCustom] = useState("");
+  const [createdAccessCode, setCreatedAccessCode] = useState("");
+  const [creatingAccessCode, setCreatingAccessCode] = useState(false);
+
+  const [accessCodes, setAccessCodes] = useState([]);
+  const [loadingAccessCodes, setLoadingAccessCodes] = useState(false);
+  const [revokingAccessCodeId, setRevokingAccessCodeId] = useState(null);
 
   const [renameDialog, setRenameDialog] = useState(false);
   const [renameValue, setRenameValue] = useState("");
@@ -62,6 +83,8 @@ function App() {
   const [linkMaxUses, setLinkMaxUses] = useState("1");
   const [linkZeroKnowledge, setLinkZeroKnowledge] = useState(true);
   const [createdLinkUrl, setCreatedLinkUrl] = useState("");
+  const [linkAccessCode, setLinkAccessCode] = useState("");
+  const [createdLinkAccessCode, setCreatedLinkAccessCode] = useState("");
   const [creatingLink, setCreatingLink] = useState(false);
 
   useEffect(() => {
@@ -93,6 +116,89 @@ function App() {
       }
     }
   }, [view, token]);
+
+  useEffect(() => {
+    if (shareDialog && selectedFile?.id) {
+      loadAccessCodes(selectedFile.id);
+    }
+  }, [shareDialog, selectedFile?.id]);
+
+  const ensureGoogleScript = () => {
+    if (window.google?.accounts?.id) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[data-google-identity="true"]');
+      if (existing) {
+        existing.addEventListener("load", () => resolve());
+        existing.addEventListener("error", () => reject(new Error("Failed to load Google Identity script")));
+        return;
+      }
+      const script = document.createElement("script");
+      script.src = "https://accounts.google.com/gsi/client";
+      script.async = true;
+      script.defer = true;
+      script.dataset.googleIdentity = "true";
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error("Failed to load Google Identity script"));
+      document.head.appendChild(script);
+    });
+  };
+
+  const handleGoogleCredential = async (credentialResponse) => {
+    const idToken = credentialResponse?.credential;
+    if (!idToken) {
+      toast.error("Google login failed (missing credential)");
+      return;
+    }
+    try {
+      setGoogleSigningIn(true);
+      const res = await axios.post(`${API}/auth/google`, { id_token: idToken });
+      setToken(res.data.access_token);
+      setUser(res.data.user);
+      localStorage.setItem("token", res.data.access_token);
+      localStorage.setItem("user", JSON.stringify(res.data.user));
+      toast.success("Login successful!");
+      setView("dashboard");
+    } catch (err) {
+      toast.error(prettyApiError(err, "Google login failed"));
+    } finally {
+      setGoogleSigningIn(false);
+    }
+  };
+
+  useEffect(() => {
+    if (view !== "landing") return;
+    if (!GOOGLE_CLIENT_ID) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        await ensureGoogleScript();
+        if (cancelled) return;
+
+        window.google.accounts.id.initialize({
+          client_id: GOOGLE_CLIENT_ID,
+          callback: handleGoogleCredential,
+        });
+
+        const el = document.getElementById("google-signin-btn");
+        if (el) {
+          el.innerHTML = "";
+          window.google.accounts.id.renderButton(el, {
+            theme: "outline",
+            size: "large",
+            shape: "rectangular",
+          });
+        }
+      } catch (e) {
+        // Silent fail: keep email/password login working.
+        console.warn(e);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [view]);
 
   const axiosConfig = () => ({
     headers: { Authorization: `Bearer ${token}` }
@@ -290,28 +396,57 @@ function App() {
   const handleUpload = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    
+
+    setPendingUploadFile(file);
+    setPendingUploadPassword("");
+    setUploadDialog(true);
+    e.target.value = "";
+  };
+
+  const confirmUpload = async () => {
+    const file = pendingUploadFile;
+    const accessPassword = pendingUploadPassword;
+    if (!file) {
+      toast.error("No file selected");
+      return;
+    }
+    if (!accessPassword || accessPassword.length < 4) {
+      toast.error("Enter a file password (min 4 chars)");
+      return;
+    }
+
     setUploading(true);
-    const formData = new FormData();
-    formData.append("file", file);
-    
     try {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("access_password", accessPassword);
       const res = await axios.post(`${API}/files/upload`, formData, axiosConfig());
       toast.success(`File encrypted and uploaded: ${res.data.filename}`);
+      setUploadDialog(false);
+      setPendingUploadFile(null);
+      setPendingUploadPassword("");
       loadFiles();
     } catch (err) {
       toast.error(err.response?.data?.detail || "Upload failed");
     } finally {
       setUploading(false);
-      e.target.value = "";
     }
   };
 
-  const handleDownload = async (fileId, filename) => {
+  const handleDownload = async (fileId, filename, accessCode) => {
+    if (!accessCode) {
+      toast.error("Access code required");
+      return false;
+    }
     try {
+      setDownloading(true);
       const res = await axios.get(`${API}/files/download/${fileId}`, {
         ...axiosConfig(),
-        responseType: "blob"
+        responseType: "blob",
+        headers: {
+          ...(axiosConfig()?.headers || {}),
+          "X-File-Access-Code": accessCode,
+        },
       });
       const url = window.URL.createObjectURL(new Blob([res.data]));
       const link = document.createElement("a");
@@ -321,8 +456,12 @@ function App() {
       link.click();
       link.remove();
       toast.success("File downloaded and decrypted");
+      return true;
     } catch (err) {
-      toast.error("Download failed");
+      toast.error(prettyApiError(err, "Download failed"));
+      return false;
+    } finally {
+      setDownloading(false);
     }
   };
 
@@ -365,6 +504,76 @@ function App() {
     setShareEmail("");
     setShareRole("viewer");
     setSelectedFile(null);
+    setAccessCodeEmail("");
+    setAccessCodeTtl("10");
+    setAccessCodeCustom("");
+    setCreatedAccessCode("");
+    setCreatingAccessCode(false);
+    setAccessCodes([]);
+    setLoadingAccessCodes(false);
+    setRevokingAccessCodeId(null);
+  };
+
+  const loadAccessCodes = async (fileId) => {
+    if (!fileId) return;
+    setLoadingAccessCodes(true);
+    try {
+      const res = await axios.get(`${API}/files/${fileId}/access-codes`, axiosConfig());
+      setAccessCodes(res.data.codes || []);
+    } catch (err) {
+      toast.error(prettyApiError(err, "Failed to load access codes"));
+    } finally {
+      setLoadingAccessCodes(false);
+    }
+  };
+
+  const handleRevokeAccessCode = async (codeId) => {
+    if (!selectedFile || !codeId) return;
+    setRevokingAccessCodeId(codeId);
+    try {
+      await axios.delete(`${API}/files/${selectedFile.id}/access-codes/${codeId}`, axiosConfig());
+      toast.success("Access code revoked");
+      await loadAccessCodes(selectedFile.id);
+    } catch (err) {
+      toast.error(prettyApiError(err, "Failed to revoke access code"));
+    } finally {
+      setRevokingAccessCodeId(null);
+    }
+  };
+
+  const handleCreateAccessCode = async () => {
+    if (!selectedFile) {
+      toast.error("No file selected");
+      return;
+    }
+    const expiresInMinutes = Number(accessCodeTtl);
+    if (!Number.isFinite(expiresInMinutes) || expiresInMinutes <= 0) {
+      toast.error("Invalid expiry");
+      return;
+    }
+
+    setCreatingAccessCode(true);
+    setCreatedAccessCode("");
+    try {
+      const trimmedCustomCode = accessCodeCustom.trim();
+      const payload = {
+        expiresInMinutes,
+        allowedEmail: accessCodeEmail ? accessCodeEmail.trim() : null,
+        label: accessCodeEmail ? `for:${accessCodeEmail.trim()}` : null,
+      };
+      if (trimmedCustomCode) payload.accessCode = trimmedCustomCode;
+      const res = await axios.post(
+        `${API}/files/${selectedFile.id}/access-codes`,
+        payload,
+        axiosConfig()
+      );
+      setCreatedAccessCode(res.data.code);
+      toast.success("Access code created");
+    } catch (err) {
+      toast.error(prettyApiError(err, "Create access code failed"));
+    } finally {
+      setCreatingAccessCode(false);
+    }
   };
 
   const closeRenameDialog = () => {
@@ -378,10 +587,12 @@ function App() {
     setLinkDialog(false);
     setSelectedFile(null);
     setCreatedLinkUrl("");
+    setCreatedLinkAccessCode("");
     setCreatingLink(false);
     setLinkExpires("10");
     setLinkMaxUses("1");
     setLinkZeroKnowledge(true);
+    setLinkAccessCode("");
   };
 
   const handleCreateLink = async () => {
@@ -402,12 +613,16 @@ function App() {
 
     setCreatingLink(true);
     try {
+      const trimmedAccessCode = linkAccessCode.trim();
+      const createBody = { expiresInMinutes, maxUses, zeroKnowledge: linkZeroKnowledge };
+      if (trimmedAccessCode) createBody.accessCode = trimmedAccessCode;
       const res = await axios.post(
         `${API}/files/${selectedFile.id}/share-link`,
-        { expiresInMinutes, maxUses, zeroKnowledge: linkZeroKnowledge },
+        createBody,
         axiosConfig()
       );
       let url = res.data.url;
+      setCreatedLinkAccessCode(res.data.accessCode || "");
 
       if (linkZeroKnowledge) {
         // Setup fragment-secret encrypted file key, without sending the secret to server
@@ -525,10 +740,16 @@ function App() {
 
   const handleOpenShareLink = async () => {
     if (!shareToken) return;
+    if (!shareAccessCode.trim()) {
+      toast.error("Enter access code");
+      return;
+    }
     setShareLoading(true);
     try {
       const fragmentSecret = (window.location.hash || "").replace("#", "") || null;
-      const res = await axios.get(`${API}/share/${shareToken}`);
+      const res = await axios.get(`${API}/share/${shareToken}`, {
+        headers: { "X-Share-Access-Code": shareAccessCode },
+      });
       const payload = res.data;
       const filename = payload.file?.filename || "shared-file";
       setShareFileName(filename);
@@ -604,12 +825,25 @@ function App() {
                 {shareFileName ? `File: ${shareFileName}` : "This link provides temporary access."}
               </CardDescription>
             </CardHeader>
-            <CardContent style={{ display: "flex", gap: 12, alignItems: "center" }}>
-              <Button onClick={handleOpenShareLink} disabled={shareLoading}>
-                <Download size={16} />
-                {shareLoading ? "Preparing..." : "Download"}
-              </Button>
-              <Badge variant="secondary">One-time / Expiring link</Badge>
+            <CardContent style={{ display: "grid", gap: 12 }}>
+              <div style={{ display: "grid", gap: 6 }}>
+                <Label htmlFor="share-access-code">Access code</Label>
+                <Input
+                  id="share-access-code"
+                  type="password"
+                  value={shareAccessCode}
+                  onChange={(e) => setShareAccessCode(e.target.value)}
+                  placeholder="Enter code"
+                  autoFocus
+                />
+              </div>
+              <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                <Button onClick={handleOpenShareLink} disabled={shareLoading}>
+                  <Download size={16} />
+                  {shareLoading ? "Preparing..." : "Download"}
+                </Button>
+                <Badge variant="secondary">One-time / Expiring link</Badge>
+              </div>
             </CardContent>
           </Card>
         </div>
@@ -705,6 +939,18 @@ function App() {
                         Login
                       </Button>
                     </form>
+
+                    {GOOGLE_CLIENT_ID && (
+                      <div style={{ marginTop: "1rem", display: "flex", justifyContent: "center" }}>
+                        <div id="google-signin-btn" />
+                      </div>
+                    )}
+
+                    {googleSigningIn && (
+                      <div style={{ marginTop: "0.75rem", textAlign: "center" }}>
+                        Signing in with Google...
+                      </div>
+                    )}
                   </CardContent>
                 </TabsContent>
                 
@@ -904,6 +1150,41 @@ function App() {
                 </div>
               </div>
 
+              <Dialog open={uploadDialog} onOpenChange={(open) => {
+                if (!open) {
+                  setUploadDialog(false);
+                  setPendingUploadFile(null);
+                  setPendingUploadPassword("");
+                } else {
+                  setUploadDialog(true);
+                }
+              }}>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Set File Password</DialogTitle>
+                    <DialogDescription>
+                      Set a password for "{pendingUploadFile?.name}". This password is unique to this file.
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div style={{ display: "grid", gap: 12 }}>
+                    <div style={{ display: "grid", gap: 6 }}>
+                      <Label htmlFor="upload-file-password">File password</Label>
+                      <Input
+                        id="upload-file-password"
+                        type="password"
+                        value={pendingUploadPassword}
+                        onChange={(e) => setPendingUploadPassword(e.target.value)}
+                        placeholder="Enter password (min 4 chars)"
+                        autoFocus
+                      />
+                    </div>
+                    <Button onClick={confirmUpload} disabled={uploading}>
+                      {uploading ? "Uploading..." : "Upload"}
+                    </Button>
+                  </div>
+                </DialogContent>
+              </Dialog>
+
               <div className="files-grid">
                 {files.length === 0 ? (
                   <div className="empty-state" data-testid="empty-files-message">
@@ -947,13 +1228,20 @@ function App() {
                         {file.my_role && (
                           <div className="shared-info">
                             <Badge variant="secondary">Role: {file.my_role}</Badge>
+                            {file.access_protected && (
+                              <Badge variant="outline" style={{ marginLeft: 8 }}>Protected</Badge>
+                            )}
                           </div>
                         )}
 
                         <div className="file-actions">
                           <Button
                             variant="outline"
-                            onClick={() => handleDownload(file.id, file.filename)}
+                            onClick={() => {
+                              setDownloadTarget({ id: file.id, filename: file.filename });
+                              setDownloadAccessCode("");
+                              setDownloadDialog(true);
+                            }}
                             data-testid={`download-btn-${file.id}`}
                           >
                             <Download size={14} />
@@ -974,7 +1262,6 @@ function App() {
                               New Version
                             </Button>
                           )}
-
                           {file.my_role === "owner" && (
                             <>
                               <Button
@@ -1130,8 +1417,128 @@ function App() {
                 Share File
               </Button>
 
+              <div style={{ margin: "12px 0" }} />
+
+              <Label htmlFor="access-code-email">Create time-limited access code (optional email)</Label>
+              <Input
+                id="access-code-email"
+                type="email"
+                placeholder="recipient@example.com (optional)"
+                value={accessCodeEmail}
+                onChange={(e) => setAccessCodeEmail(e.target.value)}
+              />
+
+              <Label htmlFor="access-code-ttl">Expires in (minutes)</Label>
+              <Input
+                id="access-code-ttl"
+                type="number"
+                min="1"
+                value={accessCodeTtl}
+                onChange={(e) => setAccessCodeTtl(e.target.value)}
+              />
+
+              <Label htmlFor="access-code-custom">Custom access code (optional)</Label>
+              <Input
+                id="access-code-custom"
+                type="text"
+                placeholder="Leave blank to auto-generate"
+                value={accessCodeCustom}
+                onChange={(e) => setAccessCodeCustom(e.target.value)}
+              />
+
+              <Button onClick={handleCreateAccessCode} disabled={creatingAccessCode}>
+                {creatingAccessCode ? "Creating..." : "Generate Access Code"}
+              </Button>
+
+              {createdAccessCode && (
+                <div style={{ display: "grid", gap: 6 }}>
+                  <Label>New access code (copy & send to recipient)</Label>
+                  <Input value={createdAccessCode} readOnly />
+                </div>
+              )}
+
+              <Button
+                variant="outline"
+                onClick={() => selectedFile?.id && loadAccessCodes(selectedFile.id)}
+                disabled={loadingAccessCodes}
+              >
+                {loadingAccessCodes ? "Refreshing..." : "Refresh Access Codes"}
+              </Button>
+
+              {accessCodes.length > 0 && (
+                <div style={{ display: "grid", gap: 8 }}>
+                  <Label>Existing access codes (this file only)</Label>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {accessCodes.map((c) => (
+                      <div key={c.id} style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+                        <div style={{ fontSize: 12 }}>
+                          <div><strong>{c.label || "code"}</strong></div>
+                          <div>expires: {c.expires_at}</div>
+                          {c.allowed_email && <div>only: {c.allowed_email}</div>}
+                        </div>
+                        <Button
+                          variant="destructive"
+                          size="sm"
+                          onClick={() => handleRevokeAccessCode(c.id)}
+                          disabled={revokingAccessCodeId === c.id}
+                        >
+                          {revokingAccessCodeId === c.id ? "Revoking..." : "Revoke"}
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <Button variant="destructive" onClick={handleRevoke}>
                 Revoke Access
+              </Button>
+            </div>
+          </DialogContent>
+        </Dialog>
+
+        {/* Download Access Code Dialog */}
+        <Dialog open={downloadDialog} onOpenChange={(open) => {
+          if (!open) {
+            setDownloadDialog(false);
+            setDownloadTarget(null);
+            setDownloadAccessCode("");
+          } else {
+            setDownloadDialog(true);
+          }
+        }}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Enter Access Code</DialogTitle>
+              <DialogDescription>
+                Enter the file password or a time-limited access code.
+              </DialogDescription>
+            </DialogHeader>
+            <div style={{ display: "grid", gap: 12 }}>
+              <div style={{ display: "grid", gap: 6 }}>
+                <Label htmlFor="download-access-code">Access code</Label>
+                <Input
+                  id="download-access-code"
+                  type="password"
+                  value={downloadAccessCode}
+                  onChange={(e) => setDownloadAccessCode(e.target.value)}
+                  placeholder="Enter code"
+                  autoFocus
+                />
+              </div>
+              <Button
+                onClick={async () => {
+                  if (!downloadTarget) return;
+                  const ok = await handleDownload(downloadTarget.id, downloadTarget.filename, downloadAccessCode);
+                  if (ok) {
+                    setDownloadDialog(false);
+                    setDownloadTarget(null);
+                    setDownloadAccessCode("");
+                  }
+                }}
+                disabled={downloading}
+              >
+                {downloading ? "Downloading..." : "Download"}
               </Button>
             </div>
           </DialogContent>
@@ -1205,6 +1612,15 @@ function App() {
                 <Switch checked={linkZeroKnowledge} onCheckedChange={setLinkZeroKnowledge} />
               </div>
 
+              <Label htmlFor="link-access-code">Access code (optional)</Label>
+              <Input
+                id="link-access-code"
+                type="text"
+                value={linkAccessCode}
+                onChange={(e) => setLinkAccessCode(e.target.value)}
+                placeholder="Leave blank to auto-generate"
+              />
+
               <Button onClick={handleCreateLink} disabled={creatingLink}>
                 <Key size={16} />
                 {creatingLink ? "Creating..." : "Create Link"}
@@ -1214,6 +1630,13 @@ function App() {
                 <>
                   <Label>Link</Label>
                   <Input value={createdLinkUrl} readOnly />
+
+                  {!!createdLinkAccessCode && (
+                    <>
+                      <Label>Access code</Label>
+                      <Input value={createdLinkAccessCode} readOnly />
+                    </>
+                  )}
                 </>
               )}
             </div>

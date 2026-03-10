@@ -62,6 +62,7 @@ This project is designed as a secure file-sharing system with robust security fe
    DB_NAME=securefileshare
    SECRET_KEY=your-secret-key-here
    CORS_ORIGINS=http://localhost:3000
+   GOOGLE_CLIENT_ID=your-google-oauth-client-id
    ```
 
 ### Frontend Setup
@@ -141,13 +142,17 @@ The backend provides RESTful APIs for all operations. Key endpoints include:
 - `POST /api/auth/register` - User registration
 - `POST /api/auth/login` - User login
 - `POST /api/auth/verify-otp` - OTP verification
-- `POST /api/files/upload` - File upload
+- `POST /api/files/upload` - File upload (multipart: `file` + `access_password` per file)
 - `GET /api/files/list` - List user files
-- `GET /api/files/download/{file_id}` - Download file
+- `GET /api/files/download/{file_id}` - Download file (requires `X-File-Access-Code` header)
 - `DELETE /api/files/delete/{file_id}` - Delete file
 - `POST /api/files/share/{file_id}` - Share file
-- `POST /api/files/{file_id}/share-link` - Create expiring link (limited uses)
-- `GET /api/share/{token}` - Download payload for share link (no auth)
+- `PUT /api/files/{file_id}/access-password` - (Owner) Set file access password
+- `POST /api/files/{file_id}/access-codes` - (Owner) Create expiring access code (optionally bound to an email)
+- `GET /api/files/{file_id}/access-codes` - (Owner) List access codes for a file
+- `DELETE /api/files/{file_id}/access-codes/{code_id}` - (Owner) Revoke an access code for a file
+- `POST /api/files/{file_id}/share-link` - Create expiring link (limited uses) (returns `{ url, accessCode }`)
+- `GET /api/share/{token}` - Download payload for share link (requires `X-Share-Access-Code` header; no auth)
 - `POST /api/share/{token}/zk-setup` - (Optional) Store fragment-secret wrapped file key for link
 - `DELETE /api/files/revoke/{file_id}` - Revoke access for a user (owner only)
 - `GET /api/files/key/{file_id}` - (Owner only) Export file AES key for demo/zk link setup

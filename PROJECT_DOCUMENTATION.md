@@ -183,9 +183,11 @@
 
 ### Temporary Link Flow (Expiring + Limited Uses)
 1. Owner creates a link with `expiresInMinutes` and `maxUses` (e.g., one-time)
-2. Backend stores only `token_hash` (never stores the raw token)
-3. Public endpoint `GET /api/share/{token}`:
+2. Backend stores only `token_hash` and `access_code_hash` (never stores the raw token/code)
+3. Backend returns `{ url, accessCode }` once so the owner can share the access code out-of-band
+4. Public endpoint `GET /api/share/{token}` (requires `X-Share-Access-Code` header):
   - Validates not expired and not consumed
+  - Validates provided code (either the per-file password or the link-specific access code)
   - Consumes one use (one-time links become invalid immediately after a successful retrieval)
   - Returns ciphertext/iv/tag + sha256 + a wrapped file key for the link
 
@@ -205,13 +207,17 @@
 ### File Management
 - `POST /api/files/upload` - Upload and encrypt file
 - `GET /api/files/list` - List user's files
-- `GET /api/files/download/{file_id}` - Download and decrypt file
+- `GET /api/files/download/{file_id}` - Download and decrypt file (requires `X-File-Access-Code`)
 - `DELETE /api/files/delete/{file_id}` - Delete file
 - `POST /api/files/share/{file_id}` - Share file with user
+- `PUT /api/files/{file_id}/access-password` - (Owner) Set/rotate file access password
+- `POST /api/files/{file_id}/access-codes` - (Owner) Create expiring access code (DAC)
+- `GET /api/files/{file_id}/access-codes` - (Owner) List access codes for a file
+- `DELETE /api/files/{file_id}/access-codes/{code_id}` - (Owner) Revoke an access code for a file
 
 ### Temporary Links
-- `POST /api/files/{file_id}/share-link` - Create expiring link (limited uses)
-- `GET /api/share/{token}` - Public share link payload (no auth)
+- `POST /api/files/{file_id}/share-link` - Create expiring link (limited uses) (returns `{ url, accessCode }`)
+- `GET /api/share/{token}` - Public share link payload (requires `X-Share-Access-Code`; no auth)
 - `POST /api/share/{token}/zk-setup` - Save fragment-secret wrapped file key (owner)
 - `DELETE /api/files/revoke/{file_id}` - Revoke access (owner)
 
