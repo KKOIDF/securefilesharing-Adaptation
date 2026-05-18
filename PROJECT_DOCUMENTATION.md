@@ -30,8 +30,10 @@
 - **Implementation**:
   - 6-digit OTP generated on login
   - OTP expires after 5 minutes
-  - Demo mode: OTP displayed on screen (for graduation demo)
-  - Production: OTP sent via email service
+  - OTP is sent to the user's email via SMTP
+  - OTP is hashed before being stored in MongoDB
+  - Resend requests are rate-limited with cooldown protection
+  - Failed OTP attempts are capped before forcing a new login
 - **Security**: Prevents unauthorized access even with compromised passwords
 
 ### 4. Role-Based Access Control (RBAC)
@@ -127,7 +129,8 @@
 ```json
 {
   "email": "user@example.com",
-  "otp": "123456",
+  "otp_hash": "sha256_hash",
+  "attempts": 0,
   "created_at": "ISO_datetime",
   "expires_at": "ISO_datetime"
 }
@@ -200,9 +203,35 @@
 
 ### Authentication
 - `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login and receive OTP
+- `POST /api/auth/login` - Validate password and send OTP to email
 - `POST /api/auth/verify-otp` - Verify OTP and get JWT token
 - `POST /api/auth/resend-otp` - Resend OTP
+
+## Email OTP Authentication Adaptation
+
+The original demo mode displayed OTP codes directly on the screen. This adaptation improves the authentication process by sending OTP codes to the user's registered email address.
+
+### Authentication Flow
+
+1. User enters email and password.
+2. Backend validates the user's credentials.
+3. Backend generates a 6-digit OTP.
+4. OTP is hashed and stored in MongoDB.
+5. The plain OTP is sent to the user's email.
+6. User enters the OTP in the verification page.
+7. Backend hashes the submitted OTP and compares it with the stored hash.
+8. If valid and not expired, the backend issues a JWT token.
+9. The OTP is deleted after successful verification.
+
+### Security Improvements
+
+- OTP is no longer displayed on screen.
+- OTP is sent to the user's email.
+- OTP expires after 5 minutes.
+- OTP is hashed before storage.
+- OTP can only be used once.
+- Failed OTP attempts are limited.
+- Resend OTP has cooldown protection.
 
 ### File Management
 - `POST /api/files/upload` - Upload and encrypt file
@@ -282,12 +311,12 @@ For graduation demo purposes, you can create accounts with different roles:
 - Password: `admin123`
 - Role: `admin`
 
-**Note**: OTP is displayed on screen for demo purposes.
+**Note**: OTP is delivered through the configured email inbox, so demo verification now requires access to that inbox.
 
 ## 🔒 Security Considerations
 
 ### Production Recommendations
-1. **Email Service**: Integrate real email service (SendGrid, AWS SES) for OTP delivery
+1. **Email Service**: For production scale, consider a managed provider such as SendGrid or AWS SES instead of basic SMTP.
 2. **Key Storage**: Consider hardware security modules (HSM) for key management
 3. **File Storage**: Move to dedicated object storage (S3, Azure Blob) for scalability
 4. **HTTPS**: Ensure all communications use TLS/SSL
@@ -297,7 +326,7 @@ For graduation demo purposes, you can create accounts with different roles:
 8. **Audit Logging**: Expand logging for compliance requirements
 
 ### Current Limitations (Demo)
-- OTP displayed on screen (not sent via email)
+- SMTP delivery depends on valid provider credentials and inbox availability
 - Files stored in MongoDB (not ideal for large files)
 - Private keys stored in database (acceptable for demo, use HSM in production)
 - No file size limits implemented

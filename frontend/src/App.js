@@ -20,7 +20,7 @@ import {
 } from "@/components/ui/select";
 import { Lock, Upload, Download, Share2, Trash2, Shield, Users, Activity, FileText, LogOut, Key } from "lucide-react";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8001";
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://127.0.0.1:8000";
 const API = `${BACKEND_URL}/api`;
 const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID;
 
@@ -29,7 +29,8 @@ function App() {
   const [user, setUser] = useState(null);
   const [token, setToken] = useState(null);
   const [pendingEmail, setPendingEmail] = useState("");
-  const [demoOtp, setDemoOtp] = useState("");
+  const [otpExpiresMinutes, setOtpExpiresMinutes] = useState(5);
+  const [resendCooldown, setResendCooldown] = useState(0);
   const [googleSigningIn, setGoogleSigningIn] = useState(false);
 
   // Public share link
@@ -119,6 +120,21 @@ function App() {
       }
     }
   }, [view, token]);
+
+  useEffect(() => {
+    if (view !== "otp" || resendCooldown <= 0) return undefined;
+    const timer = window.setInterval(() => {
+      setResendCooldown((current) => {
+        if (current <= 1) {
+          window.clearInterval(timer);
+          return 0;
+        }
+        return current - 1;
+      });
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [view, resendCooldown]);
 
   useEffect(() => {
     if (shareDialog && selectedFile?.id) {
@@ -338,7 +354,8 @@ function App() {
         password: formData.get("password")
       });
       setPendingEmail(email);
-      setDemoOtp(res.data.otp_for_demo);
+      setOtpExpiresMinutes(res.data.expires_in_minutes || 5);
+      setResendCooldown(res.data.resend_cooldown_seconds || 0);
       toast.success("OTP sent to your email!");
       setView("otp");
     } catch (err) {
@@ -369,8 +386,9 @@ function App() {
   const handleResendOTP = async () => {
     try {
       const res = await axios.post(`${API}/auth/resend-otp`, { email: pendingEmail });
-      setDemoOtp(res.data.otp_for_demo);
-      toast.success("OTP resent!");
+      setOtpExpiresMinutes(res.data.expires_in_minutes || 5);
+      setResendCooldown(res.data.resend_cooldown_seconds || 0);
+      toast.success("A new OTP was sent to your email!");
     } catch (err) {
       toast.error(prettyApiError(err, "Failed to resend OTP"));
     }
@@ -379,6 +397,8 @@ function App() {
   const handleLogout = () => {
     setToken(null);
     setUser(null);
+    setPendingEmail("");
+    setResendCooldown(0);
     localStorage.removeItem("token");
     localStorage.removeItem("user");
     setView("landing");
@@ -890,8 +910,7 @@ function App() {
               <span>AES-256 & RSA Encryption</span>
             </div>
             <h1 className="hero-title">
-              Enterprise-Grade
-              <br />
+              
               <span className="hero-title-gradient">Secure File Sharing</span>
             </h1>
             <p className="hero-description">
@@ -1048,15 +1067,13 @@ function App() {
               </div>
               <CardTitle>Multi-Factor Authentication</CardTitle>
               <CardDescription>
-                Enter the 6-digit code sent to {pendingEmail}
+                We sent a 6-digit OTP to {pendingEmail}. Please check your inbox and enter it below.
               </CardDescription>
             </CardHeader>
             <CardContent>
-              {demoOtp && (
-                <div className="demo-otp" data-testid="demo-otp-display">
-                  <strong>Demo OTP:</strong> {demoOtp}
-                </div>
-              )}
+              <div className="otp-message">
+                OTP codes expire in {otpExpiresMinutes} minutes and can only be used once.
+              </div>
               <form onSubmit={handleVerifyOTP} className="otp-form">
                 <div className="form-group">
                   <Label htmlFor="otp-input">OTP Code</Label>
@@ -1078,10 +1095,11 @@ function App() {
                   type="button"
                   variant="outline"
                   onClick={handleResendOTP}
+                  disabled={resendCooldown > 0}
                   className="resend-btn"
                   data-testid="resend-otp-btn"
                 >
-                  Resend OTP
+                  {resendCooldown > 0 ? `Resend OTP in ${resendCooldown}s` : "Resend OTP"}
                 </Button>
               </form>
             </CardContent>

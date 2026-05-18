@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File, Header, Form
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from starlette.responses import JSONResponse
 from dotenv import load_dotenv
@@ -23,15 +24,26 @@ from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.backends import default_backend
 import base64
 import hashlib
-import random
 import io
 import secrets
-
-from modules.example_routes import router as example_router
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env.local', override=True)
 load_dotenv(ROOT_DIR / '.env')
+
+from modules.example_routes import router as example_router
+from email_service import send_otp_email
+from otp_service import (
+    OTP_EXPIRE_MINUTES,
+    OTP_MAX_ATTEMPTS,
+    OTP_RESEND_COOLDOWN_SECONDS,
+    generate_otp,
+    get_otp_expiry_time,
+    hash_otp,
+    is_otp_expired,
+    is_resend_allowed,
+    verify_otp_hash,
+)
 
 class _UnavailableDB:
     def __getattr__(self, name):
@@ -118,6 +130,8 @@ async def ensure_indexes() -> None:
         await db.file_permissions.create_index([("file_id", 1), ("user_email", 1)], unique=True)
         await db.file_access_codes.create_index("code_hash", unique=True)
         await db.file_access_codes.create_index("file_id")
+        await db.otp_codes.create_index("email", unique=True)
+        await db.otp_codes.create_index("expires_at", expireAfterSeconds=0)
     except Exception:
         # Index creation is best-effort (e.g., restricted MongoDB tiers)
         logger.exception("Failed to ensure MongoDB indexes")
@@ -179,6 +193,10 @@ class UserLogin(BaseModel):
 class OTPVerify(BaseModel):
     email: EmailStr
     otp: str
+
+
+class OTPResendRequest(BaseModel):
+    email: EmailStr
 
 
 class GoogleAuthRequest(BaseModel):
@@ -579,10 +597,6 @@ def _wrap_file_key_token_derived(file_key_b64: str, token: str) -> dict:
         "wrap": "token-derived",
     }
 
-def generate_otp() -> str:
-    """Generate 6-digit OTP"""
-    return str(random.randint(100000, 999999))
-
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -657,27 +671,30 @@ async def login(credentials: UserLogin):
     if not user or not verify_password(credentials.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
-    # Generate OTP
     otp = generate_otp()
-    
-    # Store OTP in database (expires in 5 minutes)
-    await db.otp_codes.delete_many({"email": credentials.email})  # Clear old OTPs
-    await db.otp_codes.insert_one({
+
+    await db.otp_codes.replace_one({"email": credentials.email}, {
         "email": credentials.email,
-        "otp": otp,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-    })
-    
-    # In production, send email here. For demo, log it
-    logger.info(f"OTP for {credentials.email}: {otp}")
+        "otp_hash": hash_otp(otp),
+        "attempts": 0,
+        "created_at": datetime.now(timezone.utc),
+        "expires_at": get_otp_expiry_time(),
+    }, upsert=True)
+
+    try:
+        await run_in_threadpool(send_otp_email, credentials.email, otp, OTP_EXPIRE_MINUTES)
+    except Exception:
+        await db.otp_codes.delete_many({"email": credentials.email})
+        logger.exception("Failed to send OTP email to %s", credentials.email)
+        raise HTTPException(status_code=503, detail="Unable to send OTP email. Please try again later.")
     
     await log_action(user["email"], "Login attempt - OTP sent")
     
     return {
         "message": "OTP sent to your email",
         "email": credentials.email,
-        "otp_for_demo": otp  # Remove in production
+        "expires_in_minutes": OTP_EXPIRE_MINUTES,
+        "resend_cooldown_seconds": OTP_RESEND_COOLDOWN_SECONDS,
     }
 
 @api_router.post("/auth/verify-otp")
@@ -687,23 +704,29 @@ async def verify_otp(verification: OTPVerify):
     if not otp_record:
         raise HTTPException(status_code=400, detail="No OTP found. Please login again.")
     
-    # Check expiration
-    expires_at = datetime.fromisoformat(otp_record["expires_at"])
-    if datetime.now(timezone.utc) > expires_at:
-        await db.otp_codes.delete_one({"email": verification.email})
+    if is_otp_expired(otp_record["expires_at"]):
+        await db.otp_codes.delete_many({"email": verification.email})
         raise HTTPException(status_code=400, detail="OTP expired. Please login again.")
-    
-    # Verify OTP
-    if otp_record["otp"] != verification.otp:
+
+    if otp_record.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+        await db.otp_codes.delete_many({"email": verification.email})
+        raise HTTPException(status_code=400, detail="Too many OTP attempts. Please login again.")
+
+    if not verify_otp_hash(verification.otp, otp_record["otp_hash"]):
+        updated = await db.otp_codes.find_one_and_update(
+            {"email": verification.email},
+            {"$inc": {"attempts": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated and updated.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
+            await db.otp_codes.delete_many({"email": verification.email})
+            raise HTTPException(status_code=400, detail="Too many OTP attempts. Please login again.")
         raise HTTPException(status_code=400, detail="Invalid OTP")
     
-    # Delete OTP after successful verification
-    await db.otp_codes.delete_one({"email": verification.email})
+    await db.otp_codes.delete_many({"email": verification.email})
     
-    # Get user
     user = await db.users.find_one({"email": verification.email}, {"_id": 0})
     
-    # Create JWT token
     token = create_access_token({"sub": user["email"], "role": user["role"]})
     
     await log_action(user["email"], "Login successful")
@@ -719,26 +742,50 @@ async def verify_otp(verification: OTPVerify):
     }
 
 @api_router.post("/auth/resend-otp")
-async def resend_otp(data: dict):
-    email = data.get("email")
+async def resend_otp(data: OTPResendRequest):
+    email = data.email
     user = await db.users.find_one({"email": email}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # Generate new OTP
+
+    existing_otp = await db.otp_codes.find_one({"email": email})
+    if not existing_otp:
+        raise HTTPException(status_code=400, detail="No OTP found. Please login again.")
+
+    if is_otp_expired(existing_otp["expires_at"]):
+        await db.otp_codes.delete_many({"email": email})
+        raise HTTPException(status_code=400, detail="OTP expired. Please login again.")
+
+    if not is_resend_allowed(existing_otp["created_at"]):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Please wait {OTP_RESEND_COOLDOWN_SECONDS} seconds before requesting another OTP.",
+        )
+
     otp = generate_otp()
-    
-    await db.otp_codes.delete_many({"email": email})
-    await db.otp_codes.insert_one({
+
+    await db.otp_codes.replace_one({"email": email}, {
         "email": email,
-        "otp": otp,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
-    })
-    
-    logger.info(f"OTP for {email}: {otp}")
-    
-    return {"message": "OTP resent", "otp_for_demo": otp}
+        "otp_hash": hash_otp(otp),
+        "attempts": 0,
+        "created_at": datetime.now(timezone.utc),
+        "expires_at": get_otp_expiry_time(),
+    }, upsert=True)
+
+    try:
+        await run_in_threadpool(send_otp_email, email, otp, OTP_EXPIRE_MINUTES)
+    except Exception:
+        await db.otp_codes.delete_many({"email": email})
+        logger.exception("Failed to resend OTP email to %s", email)
+        raise HTTPException(status_code=503, detail="Unable to send OTP email. Please try again later.")
+
+    await log_action(user["email"], "OTP resent")
+
+    return {
+        "message": "New OTP sent to your email",
+        "expires_in_minutes": OTP_EXPIRE_MINUTES,
+        "resend_cooldown_seconds": OTP_RESEND_COOLDOWN_SECONDS,
+    }
 
 
 @api_router.post("/auth/google")

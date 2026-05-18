@@ -131,25 +131,13 @@ class SecureShareAPITester:
         success, response = self.make_request('POST', 'auth/login', login_data, expect_status=200)
         if not success:
             return self.log_test("User Login", False, f"Login failed: {response}")
-        
-        user_otp = response.get('otp_for_demo')
-        if not user_otp:
-            return self.log_test("User Login", False, "No OTP received")
-        
-        self.log_test("User Login", True, f"OTP received: {user_otp}")
-        
-        # Test OTP verification
-        otp_data = {
-            "email": self.test_user_email,
-            "otp": user_otp
-        }
-        
-        success, response = self.make_request('POST', 'auth/verify-otp', otp_data, expect_status=200)
-        if success and 'access_token' in response:
-            self.user_token = response['access_token']
-            return self.log_test("User OTP Verification", True, "Token received")
-        else:
-            return self.log_test("User OTP Verification", False, f"Error: {response}")
+
+        details = (
+            f"OTP email queued for {response.get('email')} "
+            f"(expires in {response.get('expires_in_minutes', 'n/a')} minutes). "
+            "Manual inbox check is required for verification."
+        )
+        return self.log_test("User Login", True, details)
 
     def test_admin_login_and_otp(self):
         """Test admin login flow with OTP verification"""
@@ -162,25 +150,13 @@ class SecureShareAPITester:
         success, response = self.make_request('POST', 'auth/login', login_data, expect_status=200)
         if not success:
             return self.log_test("Admin Login", False, f"Login failed: {response}")
-        
-        admin_otp = response.get('otp_for_demo')
-        if not admin_otp:
-            return self.log_test("Admin Login", False, "No OTP received")
-        
-        self.log_test("Admin Login", True, f"OTP received: {admin_otp}")
-        
-        # Test OTP verification
-        otp_data = {
-            "email": self.test_admin_email,
-            "otp": admin_otp
-        }
-        
-        success, response = self.make_request('POST', 'auth/verify-otp', otp_data, expect_status=200)
-        if success and 'access_token' in response:
-            self.admin_token = response['access_token']
-            return self.log_test("Admin OTP Verification", True, "Token received")
-        else:
-            return self.log_test("Admin OTP Verification", False, f"Error: {response}")
+
+        details = (
+            f"OTP email queued for {response.get('email')} "
+            f"(expires in {response.get('expires_in_minutes', 'n/a')} minutes). "
+            "Manual inbox check is required for verification."
+        )
+        return self.log_test("Admin Login", True, details)
 
     def test_file_upload(self):
         """Test file upload with encryption"""

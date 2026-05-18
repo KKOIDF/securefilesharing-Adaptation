@@ -10,7 +10,7 @@ This project is designed as a secure file-sharing system with robust security fe
 
 - **AES-256 Encryption**: Files are encrypted before storage using 256-bit keys
 - **RSA Encryption (2048-bit)**: Secure key exchange with RSA keypairs per user
-- **Email-based MFA**: 6-digit OTP verification (demo mode displays OTP on screen)
+- **Email-based MFA**: 6-digit OTP verification delivered through SMTP email
 - **Role-Based Access Control (RBAC)**:
    - Global roles: `admin` / `user`
    - Per-file roles: `owner` / `editor` / `viewer` (enforced on download/rename/version/share/revoke/link)
@@ -63,6 +63,13 @@ This project is designed as a secure file-sharing system with robust security fe
    SECRET_KEY=your-secret-key-here
    CORS_ORIGINS=http://localhost:3000
    GOOGLE_CLIENT_ID=your-google-oauth-client-id
+   SMTP_HOST=smtp.gmail.com
+   SMTP_PORT=587
+   SMTP_USER=your_email@gmail.com
+   SMTP_PASS=your_gmail_app_password
+   OTP_EXPIRE_MINUTES=5
+   OTP_RESEND_COOLDOWN_SECONDS=60
+   OTP_MAX_ATTEMPTS=5
    ```
 
 ### Frontend Setup
@@ -110,7 +117,7 @@ The application will open at `http://localhost:3000`
 
 1. Register a new account with email, password, and role selection
 2. Login with credentials
-3. Enter the 6-digit OTP displayed on the screen (demo mode)
+3. Open your email inbox and enter the 6-digit OTP sent by SecureShare
 
 ### File Operations
 
@@ -128,12 +135,25 @@ Access the admin panel if logged in as admin:
 
 ## Demo Specific Features
 
-- OTPs are displayed on screen instead of being emailed (for demo purposes)
 - Role selection during registration
 - Temporary share links: expiring + limited uses (one-time links supported)
 - Optional “zero-knowledge style” links using `#secret` URL fragment (not sent to server)
 - Clean and professional UI
 - Audit trail available in admin panel
+
+## Email OTP Authentication
+
+SecureShare adapts an email-based OTP authentication flow. After a valid email and password are submitted, the backend generates a 6-digit OTP, hashes it for storage in MongoDB, and sends the plain OTP to the user through SMTP email. The JWT access token is only issued after OTP verification succeeds.
+
+### OTP Security Features
+
+- 6-digit OTP generation
+- Email delivery through SMTP
+- OTP expiration
+- Hashed OTP storage
+- One-time use OTP
+- Resend OTP cooldown
+- Failed attempt limit
 
 ## API Endpoints
 
