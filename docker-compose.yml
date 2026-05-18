@@ -8,5 +8,42 @@ services:
       - mongo_data:/data/db
     restart: unless-stopped
 
+  backend:
+    image: python:3.12-slim
+    working_dir: /app
+    depends_on:
+      - mongo
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: securefileshare
+      SECRET_KEY: dev-secret-change-me
+      CORS_ORIGINS: http://localhost:3001,http://localhost:3000
+      APP_ENV: development
+    volumes:
+      - ./backend:/app
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt &&
+             python -m uvicorn server:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8002:8000"
+    restart: unless-stopped
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    depends_on:
+      - backend
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      REACT_APP_BACKEND_URL: http://localhost:8002
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: sh -c "npm install --legacy-peer-deps && npm start"
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+
 volumes:
   mongo_data:
